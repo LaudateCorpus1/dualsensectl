@@ -11,9 +11,13 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <poll.h>
+#include <sys/wait.h>
 
 #include <dbus/dbus.h>
 #include <hidapi/hidapi.h>
+#include <libudev.h>
 
 #include "crc32.h"
 
@@ -58,9 +62,8 @@
 #define DS_OUTPUT_LIGHTBAR_SETUP_LIGHT_OUT BIT(1)
 
 /* Status field of DualSense input report. */
-#define GENMASK(h, l) (((~0UL) << (l)) & (~0UL >> (32 - 1 - (h))))
-#define DS_STATUS_BATTERY_CAPACITY GENMASK(3, 0)
-#define DS_STATUS_CHARGING GENMASK(7, 4)
+#define DS_STATUS_BATTERY_CAPACITY 0xF
+#define DS_STATUS_CHARGING 0xF0
 #define DS_STATUS_CHARGING_SHIFT 4
 
 struct dualsense_touch_point {
@@ -155,7 +158,7 @@ struct dualsense_output_report {
 struct dualsense {
     bool bt;
     hid_device *dev;
-    uint8_t mac_address[6]; /* little endian order */
+    char mac_address[18];
     uint8_t output_seq;
 };
 
@@ -214,29 +217,82 @@ static void dualsense_send_output_report(struct dualsense *ds, struct dualsense_
     }
 }
 
-static bool dualsense_init(struct dualsense *ds)
+static bool compare_serial(const char *s, const wchar_t *dev)
 {
+    if (!s) {
+        return true;
+    }
+    const size_t len = wcslen(dev);
+    if (strlen(s) != len) {
+        return false;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        if (s[i] != dev[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool dualsense_init(struct dualsense *ds, const char *serial)
+{
+    bool ret = false;
+
     memset(ds, 0, sizeof(*ds));
 
-    ds->dev = hid_open(DS_VENDOR_ID, DS_PRODUCT_ID, NULL);
+    bool found = false;
+    struct hid_device_info *devs = hid_enumerate(DS_VENDOR_ID, DS_PRODUCT_ID);
+    struct hid_device_info *dev = devs;
+    while (dev) {
+        if (compare_serial(serial, dev->serial_number)) {
+            found = true;
+            break;
+        }
+        dev = dev->next;
+    }
+
+    if (!found) {
+        if (serial) {
+            fprintf(stderr, "Device '%s' not found\n", serial);
+        } else {
+            fprintf(stderr, "No device found\n");
+        }
+        ret = false;
+        goto out;
+    }
+
+    ds->dev = hid_open(DS_VENDOR_ID, DS_PRODUCT_ID, dev->serial_number);
     if (!ds->dev) {
         fprintf(stderr, "Failed to open device: %ls\n", hid_error(NULL));
-        return false;
+        ret = false;
+        goto out;
     }
 
-    uint8_t buf[DS_FEATURE_REPORT_PAIRING_INFO_SIZE];
-    memset(buf, 0, sizeof(buf));
-    buf[0] = DS_FEATURE_REPORT_PAIRING_INFO;
-    int res = hid_get_feature_report(ds->dev, buf, sizeof(buf));
-    if (res != sizeof(buf)) {
-        fprintf(stderr, "Invalid feature report\n");
-        return false;
+    wchar_t *serial_number = dev->serial_number;
+
+    if (wcslen(serial_number) != 17) {
+        fprintf(stderr, "Invalid device serial number: %ls\n", serial_number);
+        // Let's just fake serial number as everything except disconnecting will still work
+        serial_number = L"00:00:00:00:00:00";
     }
 
-    memcpy(ds->mac_address, &buf[1], sizeof(ds->mac_address));
-    ds->bt = *(uint32_t*)&buf[16] != 0;
+    for (int i = 0; i < 18; ++i) {
+        char c = serial_number[i];
+        if (c && (i + 1) % 3) {
+            c = toupper(c);
+        }
+        ds->mac_address[i] = c;
+    }
 
-    return true;
+    ds->bt = dev->interface_number == -1;
+
+    ret = true;
+
+out:
+    if (devs) {
+        hid_free_enumeration(devs);
+    }
+    return ret;
 }
 
 static void dualsense_destroy(struct dualsense *ds)
@@ -246,10 +302,6 @@ static void dualsense_destroy(struct dualsense *ds)
 
 static bool dualsense_bt_disconnect(struct dualsense *ds)
 {
-    char ds_mac[18];
-    snprintf(ds_mac, 18, "%.2X:%.2X:%.2X:%.2X:%.2X:%.2X", ds->mac_address[5], ds->mac_address[4], ds->mac_address[3],
-             ds->mac_address[2], ds->mac_address[1], ds->mac_address[0]);
-
     DBusError err;
     dbus_error_init(&err);
     DBusConnection *conn = dbus_bus_get(DBUS_BUS_SYSTEM, &err);
@@ -304,7 +356,7 @@ static bool dualsense_bt_disconnect(struct dualsense *ds)
                     }
                     dbus_message_iter_next(&propdict_entry);
                 }
-                if (connected && address && !strcmp(address, ds_mac) && !ds_path) {
+                if (connected && address && !strcmp(address, ds->mac_address) && !ds_path) {
                     ds_path = path;
                 }
             }
@@ -367,6 +419,7 @@ static int command_battery(struct dualsense *ds)
         return 3;
     }
 
+    const char *battery_status;
     uint8_t battery_capacity;
     uint8_t battery_data = ds_report->status & DS_STATUS_BATTERY_CAPACITY;
     uint8_t charging_status = (ds_report->status & DS_STATUS_CHARGING) >> DS_STATUS_CHARGING_SHIFT;
@@ -379,29 +432,29 @@ static int command_battery(struct dualsense *ds)
          * 0 = 0-9%, 1 = 10-19%, .. and 10 = 100%
          */
         battery_capacity = min(battery_data * 10 + 5, 100);
-        /* battery_status = POWER_SUPPLY_STATUS_DISCHARGING; */
+        battery_status = "discharging";
         break;
     case 0x1:
         battery_capacity = min(battery_data * 10 + 5, 100);
-        /* battery_status = POWER_SUPPLY_STATUS_CHARGING; */
+        battery_status = "charging";
         break;
     case 0x2:
         battery_capacity = 100;
-        /* battery_status = POWER_SUPPLY_STATUS_FULL; */
+        battery_status = "full";
         break;
     case 0xa: /* voltage or temperature out of range */
     case 0xb: /* temperature error */
         battery_capacity = 0;
-        /* battery_status = POWER_SUPPLY_STATUS_NOT_CHARGING; */
+        battery_status = "not-charging";
         break;
     case 0xf: /* charging error */
     default:
         battery_capacity = 0;
-        /* battery_status = POWER_SUPPLY_STATUS_UNKNOWN; */
+        battery_status = "unknown";
     }
 #undef min
 
-    printf("%d\n", (int)battery_capacity);
+    printf("%d %s\n", (int)battery_capacity, battery_status);
     return 0;
 }
 
@@ -412,9 +465,9 @@ static int command_lightbar1(struct dualsense *ds, char *state)
     dualsense_init_output_report(ds, &rp, rbuf);
 
     rp.common->valid_flag2 = DS_OUTPUT_VALID_FLAG2_LIGHTBAR_SETUP_CONTROL_ENABLE;
-    if (!strcmp(state, "on")) {
+    if (!strcmp(state, "ON")) {
         rp.common->lightbar_setup = DS_OUTPUT_LIGHTBAR_SETUP_LIGHT_ON;
-    } else if (!strcmp(state, "off")) {
+    } else if (!strcmp(state, "OFF")) {
         rp.common->lightbar_setup = DS_OUTPUT_LIGHTBAR_SETUP_LIGHT_OUT;
     } else {
         fprintf(stderr, "Invalid state\n");
@@ -479,9 +532,9 @@ static int command_microphone(struct dualsense *ds, char *state)
     dualsense_init_output_report(ds, &rp, rbuf);
 
     rp.common->valid_flag1 = DS_OUTPUT_VALID_FLAG1_POWER_SAVE_CONTROL_ENABLE;
-    if (!strcmp(state, "on")) {
+    if (!strcmp(state, "ON")) {
         rp.common->power_save_control &= ~DS_OUTPUT_POWER_SAVE_CONTROL_MIC_MUTE;
-    } else if (!strcmp(state, "off")) {
+    } else if (!strcmp(state, "OFF")) {
         rp.common->power_save_control |= DS_OUTPUT_POWER_SAVE_CONTROL_MIC_MUTE;
     } else {
         fprintf(stderr, "Invalid state\n");
@@ -500,9 +553,9 @@ static int command_microphone_led(struct dualsense *ds, char *state)
     dualsense_init_output_report(ds, &rp, rbuf);
 
     rp.common->valid_flag1 = DS_OUTPUT_VALID_FLAG1_MIC_MUTE_LED_CONTROL_ENABLE;
-    if (!strcmp(state, "on")) {
+    if (!strcmp(state, "ON")) {
         rp.common->mute_button_led = 1;
-    } else if (!strcmp(state, "off")) {
+    } else if (!strcmp(state, "OFF")) {
         rp.common->mute_button_led = 0;
     } else {
         fprintf(stderr, "Invalid state\n");
@@ -514,23 +567,198 @@ static int command_microphone_led(struct dualsense *ds, char *state)
     return 0;
 }
 
-static void print_help()
+static bool sh_command_wait = false;
+static const char *sh_command_add = NULL;
+static const char *sh_command_remove = NULL;
+
+static void run_sh_command(const char *command, const char *serial_number)
 {
-    printf("Usage: dualsensectl command [ARGS]\n");
-    printf("\n");
-    printf("Commands:\n");
-    printf("  power-off                                Turn off the controller (BT only)\n");
-    printf("  battery                                  Get the controller battery level\n");
-    printf("  lightbar STATE                           Enable (on) or disable (off) lightbar\n");
-    printf("  lightbar RED GREEN BLUE [BRIGHTNESS]     Set lightbar color and brightness (0-255)\n");
-    printf("  player-leds NUMBER                       Set player LEDs (1-5) or disabled (0)\n");
-    printf("  microphone STATE                         Enable (on) or disable (off) microphone\n");
-    printf("  microphone-led STATE                     Enable (on) or disable (off) microphone LED\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (!sh_command_wait) {
+            pid = fork();
+        }
+        if (pid == 0) {
+            setenv("DS_DEV", serial_number, 1);
+            system(command);
+            exit(1);
+        } else if (pid < 0) {
+            perror("fork");
+            exit(1);
+        }
+        exit(0);
+    } else if (pid < 0) {
+        perror("fork");
+    } else {
+        int status = 0;
+        waitpid(pid, &status, 0);
+    }
 }
 
-static void print_version()
+static uint32_t read_file_hex(const char *path)
+{
+    uint32_t out = 0;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return out;
+    }
+    fscanf(f, "%x", &out);
+    fclose(f);
+    return out;
+}
+
+static void read_file_str(const char *path, char *buf, size_t size)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+    fread(buf, size, 1, f);
+    buf[size - 1] = '\0';
+    fclose(f);
+}
+
+static bool check_dualsense_device(struct udev_device *dev, char serial_number[18])
+{
+    const char *path = udev_device_get_syspath(dev);
+    char *end = strrchr(path, '/');
+    if (!end || strncmp(end, "/event", 6)) {
+        return false;
+    }
+
+    const char *joystick = udev_device_get_property_value(dev, "ID_INPUT_JOYSTICK");
+    if (!joystick || strcmp(joystick, "1")) {
+        return false;
+    }
+
+    size_t baselen = end - path + 1;
+    char idpath[256];
+    strncpy(idpath, path, baselen);
+    idpath[baselen] = '\0';
+    char *baseend = idpath + baselen;
+
+    strcpy(baseend, "id/vendor");
+    uint32_t vendor = read_file_hex(idpath);
+
+    strcpy(baseend, "id/product");
+    uint32_t product = read_file_hex(idpath);
+
+    strcpy(baseend, "uniq");
+    read_file_str(idpath, serial_number, 18);
+
+    return vendor == DS_VENDOR_ID && product == DS_PRODUCT_ID;
+}
+
+static void add_device(struct udev_device *dev)
+{
+    char serial_number[18] = "00:00:00:00:00:00";
+    if (!check_dualsense_device(dev, serial_number)) {
+        return;
+    }
+    if (sh_command_add) {
+        run_sh_command(sh_command_add, serial_number);
+    }
+}
+
+static void remove_device(struct udev_device *dev)
+{
+    char serial_number[18] = "00:00:00:00:00:00";
+    if (!check_dualsense_device(dev, serial_number)) {
+        return;
+    }
+    if (sh_command_remove) {
+        run_sh_command(sh_command_remove, serial_number);
+    }
+}
+
+static int command_monitor(void)
+{
+    struct udev *u = udev_new();
+    struct udev_enumerate *enumerate = udev_enumerate_new(u);
+    udev_enumerate_add_match_subsystem(enumerate, "input");
+    udev_enumerate_scan_devices(enumerate);
+    struct udev_list_entry *devices = udev_enumerate_get_list_entry(enumerate);
+    struct udev_list_entry *dev_list_entry;
+    udev_list_entry_foreach(dev_list_entry, devices) {
+        const char *path = udev_list_entry_get_name(dev_list_entry);
+        struct udev_device *dev = udev_device_new_from_syspath(u, path);
+        add_device(dev);
+        udev_device_unref(dev);
+    }
+    udev_enumerate_unref(enumerate);
+
+    struct udev_monitor *monitor = udev_monitor_new_from_netlink(u, "udev");
+    udev_monitor_filter_add_match_subsystem_devtype(monitor, "input", NULL);
+    udev_monitor_enable_receiving(monitor);
+
+    struct pollfd fd;
+    fd.fd = udev_monitor_get_fd(monitor);
+    fd.events = POLLIN;
+
+    while (1) {
+        int ret = poll(&fd, 1, -1);
+        if (ret < 0) {
+            perror("poll");
+            break;
+        }
+        struct udev_device *dev = udev_monitor_receive_device(monitor);
+        if (!dev) {
+            continue;
+        }
+        if (!strcmp(udev_device_get_action(dev), "add")) {
+            add_device(dev);
+        } else if (!strcmp(udev_device_get_action(dev), "remove")) {
+            remove_device(dev);
+        }
+        udev_device_unref(dev);
+    }
+
+    udev_monitor_unref(monitor);
+    udev_unref(u);
+
+    return 0;
+}
+
+static void print_help(void)
+{
+    printf("Usage: dualsensectl [options] command [ARGUMENTS]\n");
+    printf("\n");
+    printf("Options:\n");
+    printf("  -l                                          List available devices [xx:xx:xx:xx:xx:xx] (USB/Bluetooth)\n");
+    printf("  -d [DEVICE]                                 Specify which device to use [xx:xx:xx:xx:xx:xx] (USB/Bluetooth)\n");
+    printf("  -w                                          Wait for shell command to complete (Monitor only)\n");
+    printf("  -h --help                                   Shows this help message\n");
+    printf("  -v --version                                Shows version\n");
+    printf("Commands:\n");
+    printf("  power-off                                   Turn off the controller (Bluetooth only)\n");
+    printf("  battery                                     Get the controller battery level and charging/discharching information\n");
+    printf("  lightbar [STATE]                            Enable [ON] or disable [OFF] lightbar\n");
+    printf("  lightbar [RED] [GREEN] [BLUE] [BRIGHTNESS]  Set lightbar color and brightness [0-255] [0-255] [0-255] [0-255]\n");
+    printf("  player-leds [NUMBER]                        Set player LEDs [1-5] or disabled [0]\n");
+    printf("  microphone [STATE]                          Enable [ON] or disable [OFF] microphone\n");
+    printf("  microphone-led [STATE]                      Enable [ON] or disable [OFF] microphone orange LED\n");
+    printf("  monitor [add COMMAND] / [remove COMMAND]    Run shell command [COMMAND] on add/remove events\n");
+}
+
+static void print_version(void)
 {
     printf("%s\n", DUALSENSECTL_VERSION);
+}
+
+static int list_devices(void)
+{
+    struct hid_device_info *devs = hid_enumerate(DS_VENDOR_ID, DS_PRODUCT_ID);
+    if (!devs) {
+        fprintf(stderr, "No devices found\n");
+        return 1;
+    }
+    printf("Devices:\n");
+    struct hid_device_info *dev = devs;
+    while (dev) {
+        printf(" %ls (%s)\n", dev->serial_number ? dev->serial_number : L"???", dev->interface_number == -1 ? "Bluetooth" : "USB");
+        dev = dev->next;
+    }
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -540,16 +768,55 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    const char *dev_serial = NULL;
+
     if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
         print_help();
         return 0;
     } else if (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version")) {
         print_version();
         return 0;
+    } else if (!strcmp(argv[1], "-l")) {
+        return list_devices();
+    } else if (!strcmp(argv[1], "monitor")) {
+        argc -= 2;
+        argv += 2;
+        while (argc) {
+            if (!strcmp(argv[0], "-w")) {
+                sh_command_wait = true;
+            } else if (!strcmp(argv[0], "add")) {
+                if (argc < 2) {
+                    print_help();
+                    return 1;
+                }
+                sh_command_add = argv[1];
+                argc -= 1;
+                argv += 1;
+            } else if (!strcmp(argv[0], "remove")) {
+                if (argc < 2) {
+                    print_help();
+                    return 1;
+                }
+                sh_command_remove = argv[1];
+                argc -= 1;
+                argv += 1;
+            }
+            argc -= 1;
+            argv += 1;
+        }
+        return command_monitor();
+    } else if (!strcmp(argv[1], "-d")) {
+        if (argc < 3) {
+            print_help();
+            return 1;
+        }
+        dev_serial = argv[2];
+        argc -= 2;
+        argv += 2;
     }
 
     struct dualsense ds;
-    if (!dualsense_init(&ds)) {
+    if (!dualsense_init(&ds, dev_serial)) {
         return 1;
     }
 
